@@ -1,0 +1,111 @@
+
+from odoo import api, fields, models, _
+from datetime import datetime, timedelta
+from odoo.exceptions import UserError
+
+
+class RoomManage(models.Model):
+    _name = "room.manage"
+    _inherit = ['mail.thread', 'mail.activity.mixin']
+    _rec_name = "room_no"
+
+    room_no = fields.Char("Room Number", default="New", copy=False, readonly=True)
+    bed_no = fields.Integer(string="Number of Beds", required=True, default=1)
+    company_id = fields.Many2one(comodel_name="res.company", string="Company", index=True)
+    currency_id = fields.Many2one('res.currency', 'Currency',
+                                  default=lambda self: self.env.user.company_id.currency_id.id, required=True)
+    rent = fields.Float("Rent", required=True)
+    state = fields.Selection([
+        ('empty', 'Empty'),
+        ('partial', 'Partial'),
+        ('full', 'Full')
+    ], default="empty", tracking=True)
+
+    room_type = fields.Selection([
+        ('ac', 'AC'),
+        ('non_ac', 'NON AC')
+    ], required=True, default='ac', string='Room Type')
+
+    facilities_ids = fields.Many2many(comodel_name="room.facility", string="Facilities", required=True)
+    student_ids = fields.One2many(comodel_name="student.info", inverse_name="room_id")
+    total_field = fields.Float(string="Total Rent", compute="_compute_total", store=True)
+    student_invoice_id = fields.Many2one(comodel_name="student.info",
+                                         string="Student to Invoice", domain="[('room_id','=',id)]")
+
+    def action_partial(self):
+        self.write({'state': 'partial'})
+
+    def action_confirm(self):
+        self.write({'state': 'full'})
+
+    def action_empty(self):
+        self.write({'state': 'empty'})
+
+    @api.onchange('student_ids', 'bed_no')
+    def _onchange_close_move_ids(self):
+        for record in self:
+            student_count = len(record.student_ids)
+            if student_count == 0:
+                record.state = 'empty'
+            elif 0 < student_count < record.bed_no:
+                record.state = 'partial'
+            else:
+                record.state = 'full'
+
+    @api.model_create_multi
+    def create(self, vals_list):
+        """Generate a unique room number using sequence."""
+        for vals in vals_list:
+            if vals.get('room_no', _('New')) == _('New'):
+                vals['room_no'] = self.env['ir.sequence'].next_by_code('room.manage')
+        return super().create(vals_list)
+
+    @api.depends('rent', 'facilities_ids.charge')
+    def _compute_total(self):
+        for record in self:
+            facilities_total = sum(record.facilities_ids.mapped('charge'))
+            record.total_field = record.rent + facilities_total
+
+    def action_generate_bill(self):
+        """Generate an invoice for students, ensuring only one invoice per month."""
+        product = self.env["product.product"].search([('name', '=', 'PROPERTY')])
+
+        today = fields.Date.today()
+        month_start = today.replace(day=1)
+        month_end = (month_start + timedelta(days=32)).replace(day=1) - timedelta(days=1)  # Last day of the month
+
+        for rec in self:
+            invoices = []
+            for student in rec.student_ids:
+                customer = student.partner_id.id
+                existing_invoice = self.env['account.move'].search([
+                    ('partner_id', '=', customer),
+                    ('invoice_date', '>=', month_start),
+                    ('invoice_date', '<=', month_end),
+                    ('state', '!=', 'draft')  # Ignore draft invoices
+                ])
+
+                if existing_invoice:
+                    raise UserError("Charge should be greater than 0")
+
+                invoice_data = {
+                    'partner_id': customer,
+                    'move_type': 'out_invoice',
+                    'invoice_date': month_start,
+                    'invoice_date_due': month_end,
+                    'invoice_line_ids': [
+                        fields.Command.create({'product_id': product.id, 'price_unit': rec.total_field}),
+                    ],
+                }
+                new_invoice = self.env['account.move'].create(invoice_data)
+                invoices.append(new_invoice.id)
+
+        return {
+            'type': 'ir.actions.act_window',
+            'res_model': 'account.move',
+            'view_mode': 'list,form',
+            'domain': [('id', 'in', invoices)],
+        }
+
+
+
